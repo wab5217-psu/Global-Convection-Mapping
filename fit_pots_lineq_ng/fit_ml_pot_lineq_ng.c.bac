@@ -1,0 +1,742 @@
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <stddef.h>
+#include <math.h>
+#include <time.h>
+#include <sys/types.h>
+#include <dirent.h>
+#include <unistd.h>
+#include <zlib.h>
+#include "rtypes.h"
+#include "dmap.h"
+#include "option.h"
+#include "rtime.h"
+#include "radar.h"
+#include "rprm.h"
+#include "rpos.h"
+#include "fitdata.h"
+#include "cfitdata.h"
+#include "scandata.h"
+#include "fitread.h"
+#include "fitscan.h"
+#include "fitindex.h"
+#include "fitseek.h"
+#include "rtypes.h"
+#include "dmap.h"
+#include "invmag.h"
+#include "griddata.h"
+#include "gridread.h"
+
+/*#include "/home/wab5217/projects/global_convection_maps/c-code/fit_vels/ml_df.h"*/
+#include "ml_df.h"
+#include "ml_pot.h"
+
+#include "cnvgrid.h"
+#include "cnvmap.h"
+#include "cnvmapindex.h"
+#include "cnvmapseek.h"
+#include "cnvmapread.h"
+#include "cnvmapsolve.h"
+#include "aacgmlib_v2.h"
+#include "aacgm.h"
+#include "mlt_v2.h"
+#include "igrflib.h"
+
+#include <mkl.h>
+
+#define C 299792458.0 
+#define PI 3.14159265359
+#define LRE 6371.E3
+#define MAX(q,p) (((q)>(p))?(q):(p))
+#define sind(x) (sin(fmod((x),360)*PI/180))
+#define cosd(x) (cos(fmod((x),360)*PI/180))
+#define tand(x) (tan(fmod((x),360)*PI/180))
+
+
+#define BAD_VALUE -99999.9
+#define BAD_INT -9999
+
+#define MIN_LAT 55
+#define MAX_LAT 89
+
+#define ML_LAT_0 55
+#define ML_DLAT 2
+#define ML_DLON 15
+#define ML_NLON 24
+
+double dlat;
+double dlon;
+long start_time;
+long end_time;
+int ngrid;
+int nedge;
+CELL* grid;
+CELL* grid0;
+NEIGHBOR* neighbors;
+int *edge; 
+M_ARRAY* edge_array;
+int mdays[]={31,59,90,120,151,181,212,243,273,304,334};
+
+
+
+double *start_lon;
+double dlat_ng;
+double dlon_ng;
+double min_lon_ng;
+double max_lon_ng;
+char *radar_list[30];
+int nrad;
+int nbp;
+B_POINT* bp;
+long start_time;
+long end_time;
+int avg_ival;
+int smooth;
+double MODEL_SCALE;
+char ml_file[128];
+char grid_file[128];
+
+
+
+
+int dayofweek(int d, int m, int y)
+{
+    static int t[] = { 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 };
+    y -= m < 3;
+    return ( y + y/4 - y/100 + y/400 + t[m-1] + d) % 7;
+}
+ 
+char *choppy( char *s )
+{
+  char *n = malloc( strlen( s ? s : "\n" ) );
+  if( s )
+    strcpy( n, s );
+  if( s[strlen(s)-1] =='\n')
+    n[strlen(n)-1]='\0';
+  return n;
+}
+
+
+double get_random() { return (double)rand() / (double)RAND_MAX; }
+
+
+
+void parse_instructions(FILE *fp)
+{
+  char *line=NULL;
+  size_t len=0;
+  char *param=NULL;
+  char *token;
+
+  nrad=0;
+  nbp=0;
+  while( getline(&line,&len,fp)!= EOF ){
+    if(line[0]=='#' || line[0]==' ')continue;
+    param=strtok(line," ");
+    if(strcmp(param,"boundary_point")==0)
+      {
+	nbp++;
+	bp=realloc(bp,nbp*sizeof(B_POINT));
+	sscanf(strtok(NULL," "),"%lf",&bp[nbp-1].lat);
+	sscanf(strtok(NULL," "),"%lf",&bp[nbp-1].lon);
+	if( bp[nbp-1].lon<0 )bp[nbp-1].lon+=360;
+      }
+   else if(strcmp(param,"lat_dl")==0)
+     {
+	sscanf(strtok(NULL," "),"%lf",&dlat);
+     }
+   else if(strcmp(param,"lon_dl")==0)
+     {
+	sscanf(strtok(NULL," "),"%lf",&dlon);
+     }
+   else if(strcmp(param,"ng_lat_dl")==0)
+     {
+	sscanf(strtok(NULL," "),"%lf",&dlat_ng);
+     }
+   else if(strcmp(param,"ng_lon_dl")==0)
+     {
+	sscanf(strtok(NULL," "),"%lf",&dlon_ng);
+     }
+   else if(strcmp(param,"start_time")==0)
+     {
+	sscanf(strtok(NULL," "),"%ld",&start_time);
+     }
+   else if(strcmp(param,"end_time")==0)
+     {
+	sscanf(strtok(NULL," "),"%ld",&end_time);
+     }
+   else if(strcmp(param,"avg_interval")==0)
+     {
+	sscanf(strtok(NULL," "),"%d",&avg_ival);
+     }
+   else if(strcmp(param,"ml_file")==0)
+     {
+	sscanf(strtok(NULL," "),"%s",ml_file);
+     }
+   else if(strcmp(param,"grid_file")==0)
+     {
+	sscanf(strtok(NULL," "),"%s",grid_file);
+     }
+   else if(strcmp(param,"smooth")==0)
+     {
+	sscanf(strtok(NULL," "),"%d",&smooth);
+     }
+   else if(strcmp(param,"model_scale")==0)
+     {
+	sscanf(strtok(NULL," "),"%lf",&MODEL_SCALE);
+     }
+   else if(strcmp(param,"radar_list")==0)
+     {
+       while( (token=strtok(NULL," ")) != NULL)
+	 {
+	   radar_list[nrad]=choppy(token);
+	   nrad++;
+	 }
+     }
+ }
+  if(line)
+    free(line);
+}
+
+
+
+int cell_in_out(double lat, double lon, CELL cell )
+{
+  double dlon;
+  double in_lon;
+  int j,c;
+
+  in_lon=lon;
+  if(in_lon == 360) in_lon=359.8;
+  if(in_lon == 0) in_lon=.2;
+  
+  if( (lat<cell.lat[0]) || (lat>cell.lat[2]) )return(0);
+  dlon=cell.lon[1]-cell.lon[0];
+    
+  if( (in_lon>=cell.lon[0])&&(in_lon<cell.lon[1]) )
+    return(1);
+
+
+  if( ((in_lon-360)>=cell.lon[0])&&((in_lon-360)<cell.lon[1]) )
+    return(1);
+
+  if( ((in_lon+360)>=cell.lon[0])&&((in_lon+360)<cell.lon[1]) )
+    return(1);
+  
+  if( cell.lon[1]<cell.lon[0] ){
+    if( (in_lon>=cell.lon[0]-360)&&(in_lon<cell.lon[1]) ){
+      return(1);
+    }
+    if( (in_lon>cell.lon[0])&&(in_lon<cell.lon[1]+360) ){
+      if( (in_lon>=cell.lon[0]-360)&&(in_lon<cell.lon[1]) ){
+	return(1);
+      }
+    }
+  }
+  return(0);
+}  
+
+
+void find_neighbors(){
+  int jg,ig;
+  int jc;
+  double lat,lon;
+  double lon_r;
+  double dlat_l,dlon_l;
+
+  for( jg=0; jg<ngrid; jg++ ){
+    /* fprintf(stderr,"find_neighbors %d\n",jg); */
+    for( jc=0; jc<3; jc++ )neighbors[jg].lower[jc]=BAD_INT;
+    for( jc=0; jc<3; jc++ )neighbors[jg].upper[jc]=BAD_INT;
+    for( jc=0; jc<2; jc++ )neighbors[jg].left[jc]=BAD_INT;
+    for( jc=0; jc<2; jc++ )neighbors[jg].right[jc]=BAD_INT;
+    dlat_l=grid[jg].lat[2]-grid[jg].lat[0];
+    dlon_l=fabs(grid[jg].lon[1]-grid[jg].lon[0]);
+
+    if( dlon_l>300 )dlon_l-=360;
+    dlon_l=fabs(dlon_l);
+    
+    /* find lower neighbor of lower-left corner: */
+    lat=grid[jg].lat[0]-.1;
+    lon=grid[jg].lon[0]+.001;
+    for(ig=0; ig<ngrid; ig++)if(cell_in_out(lat,lon,grid[ig])){
+	neighbors[jg].lower[0]=ig;
+	break;
+      }
+    
+    /* step in longitude to find all neighbor cells below current cell */
+    ig=neighbors[jg].lower[0];
+
+    for( jc=1; jc<3; jc++ ){
+      if( (ig<0) || (ig+jc>ngrid-1) )break;
+
+      lat=grid[ig+jc].lat[3]+.1;
+      lon=grid[ig+jc].lon[3]+.001;
+      if(cell_in_out(lat,lon,grid[jg])){
+	neighbors[jg].lower[jc]=ig+jc;
+      }
+    }
+        
+    /* find adjacent right cells */
+    lat=grid[jg].lat[0]+.1;
+    lon=grid[jg].lon[1]+.1;
+    for(ig=0; ig<ngrid; ig++)if(cell_in_out(lat,lon,grid[ig])){
+	neighbors[jg].right[0]=ig;
+	break;
+      }
+    
+    if( dlat_l > (grid[neighbors[jg].right[0]].lat[2]-grid[neighbors[jg].right[0]].lat[0]) ){
+      lat=grid[jg].lat[0]+.75*dlat_l;
+      lon=grid[jg].lon[1]+.1;
+      for(ig=0; ig<ngrid; ig++)if(cell_in_out(lat,lon,grid[ig])){
+	  neighbors[jg].right[1]=ig;
+	  break;
+	}
+    }    
+    
+    /* find adjacent left cells */ 
+    lat=grid[jg].lat[0]+.1;
+    lon=grid[jg].lon[0]-.1;
+    for(ig=0; ig<ngrid; ig++)if(cell_in_out(lat,lon,grid[ig])){
+	neighbors[jg].left[0]=ig;
+	break;
+      }
+
+    if(neighbors[jg].left[0]<0)fprintf(stderr,"bad neighbor %d %d %6.2f %6.2f\n",jg,neighbors[jg].left[0],grid[jg].center_lat,grid[jg].center_lon);
+    /* if( grid[jg].lat[2]!=grid[neighbors[jg].left[0]].lat[2] ){ */
+    if( dlat_l > (grid[neighbors[jg].left[0]].lat[2]-grid[neighbors[jg].left[0]].lat[0]) ){
+      lat=grid[jg].lat[0]+.75*dlat_l;
+      lon=grid[jg].lon[0]-.1;
+      for(ig=0; ig<ngrid; ig++)if(cell_in_out(lat,lon,grid[ig])){
+	  neighbors[jg].left[1]=ig;
+	  break;
+	}
+    }
+    /* fprintf(stderr,"%d lat %5.2f dlat %5.2f  right: %d %d  left: %d %d\n",jg,grid[jg].lat[0],grid[jg].lat[3]-grid[jg].lat[0],neighbors[jg].right[0],neighbors[jg].right[1],neighbors[jg].left[0],neighbors[jg].left[1]); */
+  }
+}
+
+
+struct tm *parse_date_str( long t_i)
+{
+  struct tm *t_o;
+  char *tz;
+
+  tz = getenv("TZ");
+  setenv("TZ", "", 1);
+  tzset();
+
+  t_o=malloc(sizeof(struct tm));
+  t_o->tm_year=(int)(t_i/1e8);
+  t_o->tm_mon=(int)((t_i-1e8*t_o->tm_year)/1e6);
+  t_o->tm_mday=(int)((t_i-1e8*t_o->tm_year-1e6*t_o->tm_mon)/1e4);
+  t_o->tm_hour=(int)((t_i-1e8*t_o->tm_year-1e6*t_o->tm_mon-t_o->tm_mday*1e4)/1e2);
+  t_o->tm_min=(int)(t_i-1e8*t_o->tm_year-1e6*t_o->tm_mon-t_o->tm_mday*1e4-t_o->tm_hour*1e2);
+  t_o->tm_yday=mdays[t_o->tm_mon-1]+t_o->tm_mday;
+  t_o->tm_wday=dayofweek(t_o->tm_mday,t_o->tm_mon,t_o->tm_year);
+  if( IS_LEAPYEAR(t_o->tm_year) && t_o->tm_mon>2) t_o->tm_yday++;
+  t_o->tm_sec=0;
+  t_o->tm_year-=1900;
+  t_o->tm_mon-=1;
+  t_o->tm_isdst=0;
+  return t_o;
+}
+
+
+
+int get_gindx(double inlat, double inlon, double min_lat){
+
+  int ig;
+  
+  for(ig=0; ig<ngrid; ig++)if(cell_in_out(inlat,inlon,grid[ig])){
+      break;
+    }
+  if( ig ==ngrid )return(-1);
+  return(ig);
+  
+}
+
+int read_fit_record(FILE *fp, VDstr *vDstr){
+
+  double ml_v_n,ml_v_e;
+  int dcount;
+  int stat;
+  int npts;
+  int lat_indx=0;
+  int lon_indx=0;
+  int j;
+
+  /* int syr,smo,sdy,shr,smt,ssc; */
+  /* int eyr,emo,edy,ehr,emt,esc; */
+  
+  /* if( fscanf(fp,"%d %d %d %d %d %d",&syr,&smo,&sdy,&shr,&smt,&ssc)==EOF){ */
+  /*   return(-1); */
+  /* } */
+  
+  if(fscanf(fp,"%d %d %d %d %d %d",&vDstr->yr,&vDstr->mo,&vDstr->dy,&vDstr->hr,&vDstr->mt,&vDstr->sc)==EOF){
+    return(-1);
+  }
+
+  /* if( fscanf(fp,"%d %d %d %d %d %d",&eyr,&emo,&edy,&ehr,&emt,&esc)==EOF){ */
+  /*   return(-1); */
+  /* } */
+
+  fscanf(fp,"%f %f %f %f %f %f",&vDstr->Bx,&vDstr->By,&vDstr->Bz,&vDstr->Au,&vDstr->Al,&vDstr->v_sw);
+  fscanf(fp,"%d",&npts);
+  vDstr->npts=npts;
+
+  fprintf(stderr,"POINTS %d\n",npts);
+  
+  if( vDstr->lats != NULL )free(vDstr->lats);
+  vDstr->lats=(double *)calloc(npts,sizeof(double));
+  if( vDstr->lons != NULL )free(vDstr->lons);
+  vDstr->lons=(double *)calloc(npts,sizeof(double));
+  if( vDstr->ve != NULL )free(vDstr->ve);
+  vDstr->ve=(double *)calloc(npts,sizeof(double));
+  if( vDstr->vn != NULL )free(vDstr->vn);
+  vDstr->vn=(double *)calloc(npts,sizeof(double));
+  if( vDstr->dcount != NULL )free(vDstr->dcount);
+  vDstr->dcount=(int *)calloc(npts,sizeof(int));
+
+  for( j=0; j<npts; j++ ){
+    fscanf(fp,"%lf %lf %lf %lf %lf %lf %d",(vDstr->lats+j),(vDstr->lons+j),(vDstr->ve+j),(vDstr->vn+j),&ml_v_e,&ml_v_n,(vDstr->dcount+j));
+
+  }
+
+  return(ftell(fp));
+}
+  
+
+extern int pinv(int m,int n,double* a,double* inv);  
+VDstr vDstr;  
+
+int main(int argc,char *argv[]){
+  char *fname=NULL;  
+  FILE *vf;
+  FILE *pf;
+  FILE *gf;
+  FILE *ef;
+  FILE *fp;
+  char file_name[128];
+  double B[3];
+  double Bcar[3];
+  double Bmag;
+  double rp[3];
+  double re=RE;
+  double out_lat, out_lon, r;
+  double height=300;
+  double ee,en;
+  double lat_l,lat_u;
+  double dlon_l,dlon_ll;
+  double fl,fr;
+  double fr0,fr1,fr2;
+  
+  int fpos;
+  int j,jr,jc,jeqn;
+  int stat;
+  int indx;
+  int indx0=0;
+  int indx_ll,indx_lr,indx_r;
+  int indx_ul,indx_ur;
+  int grid_row_offset;
+  int nlon0;
+  int neqn;
+  
+  double dx,dy;
+  double min_lat=MIN_LAT;
+  double max_lat=90;
+  double min_lon=0;
+  double max_lon=360;
+
+  
+  double *data;
+  double *pot;
+  double **aa;
+  double *ef_n;
+  double *ef_e;
+  double *b_mag;
+  
+  double *solution;
+
+
+  double *G;
+  double *GTG;
+  double *INV_ar;
+  double *GTD;
+  double alpha=1;
+  double beta=0;
+  char hold_string[64];
+  int gindx;
+
+
+  dlat=1;
+
+  gf=fopen("grid.dat","r");
+
+  int ngrid0,nlon00;
+  fscanf(gf,"%s %lf",hold_string,&min_lat);
+  fscanf(gf,"%s %lf",hold_string,&max_lat);
+  fscanf(gf,"%s %lf",hold_string,&min_lon);
+  fscanf(gf,"%s %lf",hold_string,&max_lon);
+  fscanf(gf,"%s %d",hold_string,&ngrid);
+  fprintf(stderr,"ngrid: %d\n",ngrid);
+  grid=(CELL *)calloc(ngrid,sizeof(CELL));
+  nlon0=0;
+  for( jr=0; jr<ngrid; jr++ ){
+    fscanf(gf,"%d %lf  %lf\n",&gindx, &grid[jr].center_lat,&grid[jr].center_lon);
+    fscanf(gf,"%lf  %lf  %lf  %lf\n",&grid[jr].lat[0],&grid[jr].lat[1],&grid[jr].lat[2],&grid[jr].lat[3]);
+    fscanf(gf,"%lf  %lf  %lf  %lf\n",&grid[jr].lon[0],&grid[jr].lon[1],&grid[jr].lon[2],&grid[jr].lon[3]);
+    if( grid[jr].lat[0]==min_lat )nlon0++;
+  }
+  fclose(gf);
+
+  neighbors=calloc(ngrid,sizeof(struct Neighbor));
+  find_neighbors();
+  
+  
+  ef=fopen("equation_array","w");
+  fprintf(ef,"NGRID = %d\n",ngrid);
+  fprintf(stderr,"NGRID = %d\n",ngrid);
+  
+  vDstr.lats=NULL;
+  vDstr.lons=NULL;
+  vDstr.ve=NULL;
+  vDstr.vn=NULL;
+  vDstr.dcount=NULL;
+
+  fname=argv[argc-1];
+  vf=fopen(fname,"r");
+  fpos=read_fit_record(vf,&vDstr);
+
+  fprintf(stderr,"%d %d %d %d %d %d\n",vDstr.yr,vDstr.mo,vDstr.dy,vDstr.hr,vDstr.mt,vDstr.sc);
+  stat = AACGM_v2_SetDateTime(vDstr.yr,vDstr.mo,vDstr.dy,vDstr.hr,vDstr.mt,vDstr.sc);
+  stat= IGRF_SetDateTime(vDstr.yr,vDstr.mo,vDstr.dy,vDstr.hr,vDstr.mt,vDstr.sc);
+
+  char pot_file[256];
+  sprintf(pot_file,"%s.pot",fname);
+
+  
+  pf=fopen(pot_file,"w");
+
+  
+  int code=A2G;
+  int nrows=2*ngrid-nlon0;
+  int inr0, inr1, inr2;
+  
+  data=(double*)mkl_calloc(nrows,sizeof(double),64);
+
+  aa=(double **)malloc(nrows*sizeof(double*));
+  for( jr=0; jr<nrows; jr++)aa[jr]=(double*)calloc(ngrid,sizeof(double));
+
+  ef_e=(double *)calloc(ngrid,sizeof(double*));
+  ef_n=(double *)calloc(ngrid,sizeof(double*));
+  b_mag=(double *)calloc(ngrid,sizeof(double*));
+
+
+  /* build coefficient matrix */
+
+  jeqn=0;
+  for( jr=0; jr<nlon0; jr++ ){
+    aa[jeqn][jeqn]=1;
+    jeqn++;
+  }
+  
+  for( j=0; j<vDstr.npts; j++ ){
+    if(vDstr.lats[j]<min_lat+dlat)continue;
+    if(vDstr.lats[j]>max_lat)continue;
+    
+    indx=get_gindx(vDstr.lats[j],vDstr.lons[j], min_lat);
+    if( (indx>ngrid-1)||(indx<nlon0) ){
+      continue;
+    }
+    dlon_l=fabs((grid[indx].lon[1]+grid[indx].lon[2])-(grid[indx].lon[0]+grid[indx].lon[3]))/2;
+
+    if(dlon_l>300)
+      fprintf(stderr,"large dlon %d %6.2f %6.2f %6.2f %6.2f %6.2f\n",indx,dlon_l,grid[indx].lon[1],grid[indx].lon[2],grid[indx].lon[0],grid[indx].lon[3]);
+    
+    stat = AACGM_v2_Convert(vDstr.lats[j], vDstr.lons[j], height, &out_lat, &out_lon, &r, code);
+    rp[0]=(double)(re+height)/re;
+    rp[1]=(double)(90-out_lat)*DTOR;
+    rp[2]=(double)(out_lon*DTOR);
+    stat = IGRF_compute(rp,B);
+    bspcar(rp[1],rp[2],B,Bcar);
+    
+    Bmag=sqrt(Bcar[0]*Bcar[0]+Bcar[1]*Bcar[1]+Bcar[2]*Bcar[2]);
+    b_mag[indx]=Bmag;
+   
+    
+    /* first ngrid rows store d/dx terms */
+
+    inr0=BAD_INT;
+    inr1=BAD_INT;
+
+    inr0=neighbors[indx].right[0];
+    inr1=neighbors[indx].right[1];
+    
+    indx_r=neighbors[indx].right[0];
+    if( indx_r==indx )fprintf(stderr,"indicies equal: jeqn %d  indx %d \n",jeqn,indx);
+    aa[jeqn][indx]=(double)1;
+
+    if( inr1==BAD_INT){
+      aa[jeqn][inr0]=(double)-1;
+    }else{
+      aa[jeqn][inr0]=(double)-1/2;
+      aa[jeqn][inr1]=(double)-1/2;
+    }
+    
+    /* second ngrid rows store d/dy terms */
+
+    jeqn++;
+    dlat=grid[indx].lat[2]-grid[indx].lat[1];
+
+
+    inr0=BAD_INT;
+    inr1=BAD_INT;
+    inr2=BAD_INT;
+
+    inr0=neighbors[indx].lower[0];
+    if( inr0 == BAD_INT )continue;
+    inr1=neighbors[indx].lower[1];
+    inr2=neighbors[indx].lower[2];
+    /* fprintf(stderr,"%d %d %d %d\n",indx,inr0,inr1,inr2); */
+    fr0=0;
+    fr1=0;
+    fr2=0;
+    dlon_l=grid[indx].lon[1]-grid[indx].lon[0];
+    if( dlon_l>300 )dlon_l-=360;
+    dlon_l=fabs(dlon_l);
+    if( inr1 == BAD_INT ){
+      aa[jeqn][inr0]=1;
+    } else if( inr2==BAD_INT) {
+      dlon_ll=fabs(grid[inr0].lon[2]-grid[indx].lon[0]);
+      if( dlon_ll>360 )dlon_ll-=360;
+      fr0=dlon_ll/dlon_l;
+      fr1=1-fr0;
+      aa[jeqn][inr0]=fr0;
+      aa[jeqn][inr1]=fr1;
+    }else{
+
+      dlon_ll=fabs(grid[inr0].lon[2]-grid[indx].lon[0]);
+      if( dlon_ll>360 )dlon_ll-=360;
+      fr0=dlon_ll/dlon_l;
+
+      dlon_ll=fabs(grid[inr1].lon[2]-grid[inr1].lon[3]);
+      if( dlon_ll>360 )dlon_ll-=360;
+      fr1=dlon_ll/dlon_l;
+      
+      fr2=1-(fr0+fr1);
+      aa[jeqn][inr0]=fr0;
+      aa[jeqn][inr1]=fr1;
+      aa[jeqn][inr2]=fr2;
+    }
+
+    aa[jeqn][indx]=-1;
+    
+    jeqn++;
+  }
+
+  neqn=jeqn;
+  fprintf(stderr,"neqn: %d  nrows: %d\n",neqn,nrows);
+
+  for( jr=0; jr<neqn; jr++ )for( jc=0; jc<ngrid; jc++ ){
+      if( aa[jr][jc] != 0 )
+	fprintf(ef,"%d %d %6.2f %6.2f %10.4e\n",jr,jc,grid[jc].center_lat,grid[jc].center_lon,aa[jr][jc]);
+    }
+  
+  
+  G=(double*)mkl_calloc(neqn*ngrid,sizeof(double),64);
+  GTG=(double*)mkl_calloc(ngrid*ngrid,sizeof(double),64);
+  GTD=(double*)mkl_calloc(ngrid,sizeof(double),64);
+  solution=(double*)mkl_calloc(ngrid,sizeof(double),64);
+
+  INV_ar=(double*)mkl_calloc(ngrid*ngrid,sizeof(double),64);
+  
+  for(jr=0; jr<neqn; jr++)for(jc=0; jc<ngrid; jc++){
+      indx=jr*ngrid+jc;
+      G[indx]=aa[jr][jc];
+    }
+
+  
+  cblas_dgemm(CblasRowMajor,CblasTrans,CblasNoTrans,ngrid,ngrid,neqn,alpha,G,ngrid,G,ngrid,beta,GTG,ngrid);
+  
+  stat=pinv((MKL_INT)ngrid,(MKL_INT)ngrid,GTG,INV_ar);
+
+  while(1){
+    
+    jeqn=0;
+
+    for( jr=0; jr<nlon0; jr++ ){
+      data[jeqn]=0;
+      jeqn++;
+    }
+  
+    for( j=0; j<vDstr.npts; j++ ){
+      if(vDstr.lats[j]<min_lat+dlat)continue;
+      if(vDstr.lats[j]>max_lat)continue;
+    
+      indx=get_gindx(vDstr.lats[j],vDstr.lons[j], min_lat);
+      if( (indx>ngrid-1)||(indx<nlon0) ){
+	continue;
+      }
+
+      ee=vDstr.vn[j]*b_mag[indx]/1e9;
+      en=-vDstr.ve[j]*b_mag[indx]/1e9;
+      ef_e[indx]=ee;
+      ef_n[indx]=en;
+
+      /* dlon_l=grid[indx].lon[1]-grid[indx].lon[0]; */
+      /* indx_r=get_gindx(grid[indx].center_lat,grid[indx].center_lon+dlon_l,min_lat); */
+      indx_r=neighbors[indx].right[0];
+      dlon_l=fabs(grid[indx_r].center_lon-grid[indx].center_lon);
+      if( dlon_l>300 )dlon_l-=360;
+      dx=fabs(dlon_l)*LRE*DTOR*cosd(grid[indx].center_lat);
+      data[jeqn]=ee*dx;
+      jeqn++;
+
+      dlat=grid[indx].lat[2]-grid[indx].lat[1];
+      dy=dlat*LRE*DTOR;
+      data[jeqn]=en*dy;
+      jeqn++;
+        
+    }  
+    cblas_dgemv(CblasRowMajor,CblasTrans,neqn,ngrid,alpha,G,ngrid,data,(const MKL_INT)1,beta,GTD,(const MKL_INT)1);
+
+
+    cblas_dgemv(CblasRowMajor,CblasNoTrans,ngrid,ngrid,alpha,INV_ar,ngrid,GTD,(const MKL_INT)1,beta,solution,(const MKL_INT)1);
+    
+  
+    fprintf(stderr,"%d %d %d %d %d %d\n",vDstr.yr,vDstr.mo,vDstr.dy,vDstr.hr,vDstr.mt,vDstr.sc);
+    fprintf(pf,"%d %d %d %d %d %d\n",vDstr.yr,vDstr.mo,vDstr.dy,vDstr.hr,vDstr.mt,vDstr.sc);
+    fflush(pf);
+    /* fprintf(pf,"%f %f %f %f %f\n",vDstr.Bx,vDstr.By,vDstr.Bz,vDstr.Au,vDstr.Al); */
+    fprintf(pf,"%d\n",ngrid);
+    fflush(pf);
+
+    for( jc=0; jc<ngrid; jc++){
+      dlat=grid[jc].lat[2]-grid[jc].lat[0];
+      dlon_l=grid[jc].lon[1]-grid[jc].lon[0];
+      if( dlon_l > 300 ) dlon_l=fabs(dlon_l-360);
+      fprintf(pf,"%5.2f %5.3f %5.2f %5.3f %8.2f %7.4e %7.4e %7.4f %7.4f %d\n",grid[jc].center_lat,dlat,grid[jc].center_lon,dlon_l,solution[jc],ef_e[jc],ef_n[jc],vDstr.ve[jc],vDstr.vn[jc],vDstr.dcount[jc]);
+    }
+    fflush(pf);
+
+
+    fpos=read_fit_record(vf,&vDstr);
+    if( fpos==-1 )break;
+  }
+
+  fclose(vf);
+  fclose(pf);
+  fclose(ef);
+  
+  /* for( jr=0; jr<nrows; jr++)free(aa[jr]); */
+  /* free(aa); */
+  /* fprintf(stderr,"aa free\n"); */
+  
+  /* free(data); */
+  /* fprintf(stderr,"data free\n"); */
+  /* free(solution); */
+  /* fprintf(stderr,"solution free\n"); */
+	    
+}
